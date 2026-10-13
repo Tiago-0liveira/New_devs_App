@@ -8,6 +8,7 @@ async def calculate_monthly_revenue(property_id: str, tenant_id: str, month: int
 
     Month boundaries are evaluated in the property's own timezone, so a check-in
     at 2024-02-29 23:30 UTC in Europe/Paris (00:30 local) counts toward March.
+    Each reservation is rounded to cents before summing, matching invoiced amounts.
     """
     from app.core.database_pool import db_pool
     from sqlalchemy import text
@@ -19,7 +20,7 @@ async def calculate_monthly_revenue(property_id: str, tenant_id: str, month: int
     end_date = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
 
     query = text("""
-        SELECT COALESCE(SUM(r.total_amount), 0) AS total
+        SELECT COALESCE(SUM(ROUND(r.total_amount, 2)), 0) AS total
         FROM reservations r
         JOIN properties p
           ON p.id = r.property_id AND p.tenant_id = r.tenant_id
@@ -41,6 +42,8 @@ async def calculate_monthly_revenue(property_id: str, tenant_id: str, month: int
 async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str, Any]:
     """
     Aggregates revenue from database.
+    Amounts are stored with 3 decimals; each reservation is rounded to cents
+    before summing, so the total matches the sum of invoiced amounts.
     """
     try:
         # Import database pool
@@ -58,7 +61,7 @@ async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str,
                 query = text("""
                     SELECT 
                         property_id,
-                        SUM(total_amount) as total_revenue,
+                        SUM(ROUND(total_amount, 2)) as total_revenue,
                         COUNT(*) as reservation_count
                     FROM reservations 
                     WHERE property_id = :property_id AND tenant_id = :tenant_id
