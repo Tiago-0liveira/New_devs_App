@@ -1,65 +1,76 @@
-# Final Report
+# Revenue Dashboard: Bug Report
 
-Trigger: Client A said *"The revenue numbers on your dashboard don't match our internal records."*
+## What was reported
 
-| # | Issue | File | Impact |
-|---|---|---|---|
-| 1 | Cache key had no tenant | `services/cache.py` | Tenant sees another tenant's revenue |
-| 2 | DB pool failed to start, mock data served | `core/database_pool.py`, `requirements.txt` | Dashboard numbers never came from the DB |
-| 3 | Property list hardcoded in the UI | `Dashboard.tsx` | Every tenant saw prop-001..005 |
-| 4 | Monthly revenue ignored property timezone (and was a stub) | `services/reservations.py` | Sunset's March total for prop-001 off by 1250.00 |
-| 5 | Sub-cent amounts + float rounding | `services/reservations.py`, `dashboard.py`, `RevenueSummary.tsx` | Totals off by a cent vs. invoices |
+| Who | Complaint |
+|---|---|
+| Client A (Sunset Properties) | Dashboard revenue doesn't match their records, specifically for **March**. |
+| Client B (Ocean Rentals) | On refresh, they **sometimes** see revenue that looks like another company's. |
+| Finance | Some totals are **off by a few cents**, "here and there". |
 
-## 1. Cache leaks across tenants
+## Approach
 
-- **Problem:** key was `revenue:{property_id}`. `prop-001` exists for both tenants, so the first to load filled the cache for the other (5 min TTL).
-- **Fix:** key is now `revenue:{tenant_id}:{property_id}`.
-- **How found:** `redis-cli keys '*'` showed `revenue:prop-001` with no tenant, while the DB has `prop-001` under both `tenant-a` and `tenant-b`.
+1. **The database is the source of truth.** Before reading any code, I computed the expected revenue for every property straight from Postgres (`SUM(total_amount)` grouped by tenant and property).
+2. **Follow each number through the stack.** For each property I compared the database, then Redis, then the API (`curl` as each client), then the UI. The first layer where the value changes is where the bug is.
+3. **Use the wording of each complaint as a clue.** "Sometimes, on refresh" suggests a cache. "March" suggests month boundaries. "A few cents here and there" suggests rounding that only affects some rows.
 
-## 2. DB connection failure hidden by mock data
+The work found five bugs. Each one has its own commit.
 
-- **Problem:** the pool crashed on init (`'Settings' object has no attribute 'supabase_db_user'`, missing `greenlet`, `async with` on a coroutine). `calculate_total_revenue` then silently returned hardcoded mock totals, so the UI never read Postgres.
-- **Fix:** pool URL built from `settings.database_url`; removed the invalid `poolclass=QueuePool`; `get_session()` made sync; added `sqlalchemy[asyncio]`. Mock fallback left in place.
-- **How found:** compared the dashboard with manual SQL on the DB (port 5433), then `docker-compose logs backend` showed `Database error ... Database pool not available`.
+## 1. Cache leaks revenue across tenants (Ocean's privacy issue)
+
+- **How I found it:** "Sometimes when we refresh" pointed at the Redis cache (5 min TTL). I flushed Redis, loaded `prop-001` as Sunset, and ran `redis-cli keys '*'`. The key was `revenue:prop-001`, with no tenant in it, and the value inside said `tenant-a`. Next I requested `prop-001` as Ocean and got that same Sunset object back. The `properties` table showed why: `prop-001` exists under **both** `tenant-a` and `tenant-b` as two different properties.
+- **Root cause:** `backend/app/services/cache.py` built the key from `property_id` only. Whichever tenant loaded a shared ID first filled the cache, and the other tenant was served that entry until it expired.
+- **Fix:** the key is now `revenue:{tenant_id}:{property_id}`. Commit `cf78afe59`.
+
+## 2. Database never used, mock numbers served
+
+- **How I found it:** after the cache fix, Sunset `prop-001` still showed **1000.00** while SQL gave **2250.00**. `docker-compose logs backend` showed that the connection pool crashed at startup with `'Settings' object has no attribute 'supabase_db_user'`, then complained about the missing `greenlet` library, and then logged `Database pool not available` on every request. `calculate_total_revenue` catches that error and returns a hardcoded mock dictionary, and 1000.00 is one of the values in it.
+- **Root cause:** `backend/app/core/database_pool.py` read settings fields that don't exist. It also passed `QueuePool` to an async engine, which isn't allowed, and used `async with` on a coroutine. `greenlet` wasn't installed either. Because the mock fallback hid the failure, every number on the dashboard was fake.
+- **Fix:** the pool is now built from `settings.database_url`. I removed `poolclass=QueuePool`, fixed the `get_session()` context manager, and added `sqlalchemy[asyncio]` to `requirements.txt`. Commit `31e42ae42`.
 
 ## 3. Hardcoded property list
 
-- **Problem:** Sunset saw 5 properties; the DB gives it only 3 (Ocean has the other 3 incl. its own `prop-001`).
-- **Fix:** new `GET /api/v1/dashboard/properties` returns the caller's tenant properties; the dropdown loads from it.
-- **How found:** compared the properties on the website against the `properties` table, which is where the first mismatch appeared.
+- **How I found it:** I logged in as each client in a separate browser. Both saw the same five properties (`prop-001`…`prop-005`). The `properties` table gives each tenant only three, and Ocean's three include its own `prop-001`. I grepped `Dashboard.tsx` for `prop-00` and found the list was a literal array.
+- **Root cause:** the frontend never asked the backend which properties belong to the logged-in tenant.
+- **Fix:** I added a new `GET /api/v1/dashboard/properties` endpoint, scoped to the caller's tenant. The dropdown loads from it through a new `useDashboardProperties` hook. Commits `ec427e33c` and `a99ec1e71`.
 
-## 4. March totals split at the wrong month boundary
+## 4. March total wrong: months split in UTC, not property time (Sunset's issue)
 
-- **Trigger:** Client A: *"We're showing different totals for March."* Only one month was named, so the bug had to be in how reservations get bucketed into months, not in the totals themselves.
-- **Suspicion:** properties are in different timezones (Paris, New York) but `check_in_date` is stored in UTC. A booking near midnight on the 1st can fall in a different month depending on which clock decides.
-- **How found:**
-  - `calculate_monthly_revenue` was never called and always returned `Decimal('0')`. Its boundaries were naive `datetime(year, month, 1)`, i.e. UTC.
-  - Ran March per property in SQL with UTC boundaries vs. `check_in_date AT TIME ZONE p.timezone`. Only Sunset `prop-001` differs: **1000.00 (UTC) vs 2250.00 (local)**.
-  - Cause is `res-tz-1`: check-in `2024-02-29 23:30 UTC` = `2024-03-01 00:30` Paris. Client counts it in March, UTC puts it in February. 1000.00 is also the old mock value the dashboard showed for prop-001.
-- **Fix:** `calculate_monthly_revenue(property_id, tenant_id, month, year)` now queries Postgres, joins `properties` for the timezone, and filters on `check_in_date AT TIME ZONE p.timezone` within `[1st of month, 1st of next month)`. Tenant-scoped; December rolls into next year.
-- **Verified:** March 2024 → Sunset prop-001 2250.000 (2249.99 after fix 5), prop-002 4975.500, prop-003 6100.500; Ocean prop-001 0, prop-004 1776.500, prop-005 3256.000. February and December are 0 for all.
+- **How I found it:** Sunset complained about one specific month, not about every total. That pointed to how bookings are assigned to months. Properties are in Paris and New York, but `check_in_date` is stored in UTC. I ran March per property twice: once with UTC boundaries and once with `check_in_date AT TIME ZONE p.timezone`. Only Sunset `prop-001` differed: **1000.00 (UTC) vs 2250.00 (local)**. The difference is a single booking, `res-tz-1`. It checks in at `2024-02-29 23:30 UTC`, which is `2024-03-01 00:30` in Paris. Sunset counts it in March, while UTC puts it in February.
+- **Root cause:** `calculate_monthly_revenue` in `backend/app/services/reservations.py` used naive `datetime(year, month, 1)` boundaries, which are effectively UTC. It was also a stub that always returned `0`.
+- **Fix:** I implemented it against Postgres. It joins `properties` to get the timezone, filters `check_in_date AT TIME ZONE p.timezone` to `[1st of month, 1st of next month)`, is scoped by tenant, and rolls December over into January. Commit `9a62f7951`.
 
-## 5. Totals "slightly off by a few cents"
+## 5. Totals off by a few cents (finance)
 
-- **Trigger:** finance team: totals *"slightly off by a few cents here and there"*, couldn't say when or why.
-- **Suspicion:** money handled outside exact decimals somewhere between DB and screen, or a rounding-order mismatch with how finance totals bookings.
-- **How found:** traced the value DB → API → UI:
-  - `total_amount` is `NUMERIC(10,3)`. Only Sunset `prop-001` has sub-cent bookings (`res-dec-1/2/3` = 333.333 + 333.333 + 333.334). Sum-then-round = **2250.00**; round-each-booking-then-sum (what invoices add up to) = **2249.99**. That's the "here and there": only properties with sub-cent bookings drift.
-  - `dashboard.py` did `float(total)`; Python `round()` on that float gives `1.005 → 1.0`, `2.675 → 2.67`.
-  - `RevenueSummary.tsx` did `Math.round(x * 100) / 100`, inconsistent on half-cents (`1.005 → 1.00`, `1000.005 → 1000.01`), then `toLocaleString` rounded again. The component already had a "Precision Mismatch Detected" warning for this.
-- **Fix:**
-  - Both revenue queries use `SUM(ROUND(total_amount, 2))`: each booking rounded to cents (half-up) before summing, matching invoiced amounts.
-  - API keeps `Decimal`, quantizes to 0.01 `ROUND_HALF_UP` and returns `total_revenue` as a string (`"2249.99"`), no float.
-  - Frontend shows the API value as-is: no `Math.round`; removed the obsolete precision warning.
-- **Verified:** Sunset prop-001 now 2249.99 (total and March); all other properties unchanged. Revenue cache keys flushed so old values aren't served.
+- **How I found it:** "Here and there" suggested that only some rows were affected. `total_amount` is `NUMERIC(10,3)`, so I looked for amounts with a third decimal. Only Sunset `prop-001` has any: `res-dec-1/2/3` = 333.333 + 333.333 + 333.334. Summing first and rounding at the end gives **2250.00**. Rounding each booking to cents first, which is how invoices add up, gives **2249.99**. Following the value onward, `dashboard.py` converted it with `float(total)`, and `RevenueSummary.tsx` rounded it again with `Math.round(x * 100) / 100`. Both handle half-cents inconsistently: Python's `round(1.005, 2)` returns `1.0`, and JS `Math.round(1.005*100)/100` returns `1` but `Math.round(1000.005*100)/100` returns `1000.01`.
+- **Root cause:** sub-cent amounts were rounded only once, after summing, and money passed through floats and was rounded twice.
+- **Fix:** both revenue queries now use `SUM(ROUND(total_amount, 2))`. The API keeps a `Decimal`, quantizes it with `ROUND_HALF_UP`, and returns `total_revenue` as a string (`"2249.99"`). The frontend displays that value without rounding it again. Commit `920b86d76`.
 
-## Verified
+## Result
 
-| Tenant | Property | Revenue |
-|---|---|---|
-| Sunset | prop-001 | 2249.99 |
-| Sunset | prop-002 | 4975.50 |
-| Sunset | prop-003 | 6100.50 |
-| Ocean | prop-001 | 0.00 |
-| Ocean | prop-004 | 1776.50 |
-| Ocean | prop-005 | 3256.00 |
+| Tenant | Property | Before | After |
+|---|---|---|---|
+| Sunset | prop-001 | 1000.00 (mock) | 2249.99 |
+| Sunset | prop-002 | 4975.50 | 4975.50 |
+| Sunset | prop-003 | 6100.50 | 6100.50 |
+| Ocean | prop-001 | 1000.00 (Sunset's cached data) | 0.00 |
+| Ocean | prop-004 | 1776.50 | 1776.50 |
+| Ocean | prop-005 | 3256.00 | 3256.00 |
+
+Redis keys now include the tenant (`revenue:tenant-a:prop-001`). Each client sees only its own three properties, and March for Sunset `prop-001` includes the Feb 29 / Mar 1 booking.
+
+## Known, left out of scope
+
+- The dashboard shows all-time totals, not a selected month. That matches March today only because all the seed data falls in March.
+- If the database goes down, the mock fallback still returns data that isn't tenant-specific. It should fail loudly instead.
+- The API has a `default_tenant` fallback when the token has no tenant.
+- A new database pool is created on every request.
+- The "↑12%" growth badge is a hardcoded placeholder.
+
+## Verify
+
+```bash
+docker-compose up --build -d && docker-compose exec redis redis-cli flushall
+# log in at http://localhost:3000 as sunset@propertyflow.com / client_a_2024
+# and (incognito) ocean@propertyflow.com / client_b_2024, then compare with the table above
+```
